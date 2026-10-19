@@ -1,0 +1,127 @@
+"""Generate the B0 V1 report from completed local aggregates without refitting."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+
+import numpy as np
+import pandas as pd
+
+from b0_v1_baseline import OUT, REPORT, ROOT
+from s0_validation_check import digest, now, table, write_json
+from validation_core import require
+
+
+def f(value, digits=2):
+    return f"{value:,.{digits}f}"
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8")
+    s = json.loads((OUT / "summary.json").read_text(encoding="utf-8"))
+    require(s["status"] == "passed" and s["model_fit_count"] == 2, "Completed B0 V1 required")
+    require(not s["B1_executed"] and not s["V2_executed"], "Scope mismatch")
+    require(digest(ROOT / "reports/EDA_진행계획.md") == s["eda_plan_sha256"], "EDA state changed")
+    for rel, expected in s["code_sha256"].items():
+        require(digest(OUT / "executed_code" / rel.replace("\\", "/").split("/")[-1]) == expected,
+                "Executed code archive mismatch")
+    matrices = []
+    for label in ("round_10", "round_17", "mean"):
+        frame = pd.read_parquet(OUT / f"predictions_{label}.parquet")
+        require(len(frame) == 2222352 and not frame.duplicated(["site_id", "ts"]).any(),
+                "Serialized prediction grid mismatch")
+        matrix = frame.pivot(index="ts", columns="site_id", values="kwh")
+        require(matrix.shape == (8784, 253) and np.isfinite(matrix.to_numpy()).all()
+                and (matrix.to_numpy() >= 0).all(), "Invalid serialized predictions")
+        matrices.append(matrix)
+    pd.testing.assert_frame_equal((matrices[0] + matrices[1]) / 2, matrices[2])
+    for fit in s["fits"]:
+        require(digest(OUT / f"model_round_{fit['round']}.txt") == fit["model_sha256"], "Saved model changed")
+    scores, indiv = s["group_scores"], s["individual_scores"]
+    proxy = next(x for x in scores if x["sample"] == "fixed_148" and x["period"] == "all")
+    common = next(x for x in scores if x["sample"] == "common_253" and x["period"] == "all")
+    overall = next(x for x in indiv if x["scope"] == "all")
+    worst = max((x for x in scores if x["sample"] == "fixed_148" and x["period"].startswith("Q")),
+                key=lambda x: x["weighted_group_mae_kwh"])
+    qrows = [[x["period"], f(x["times"], 0), f(x["price_k_sum"]), f(x["W_local"]),
+              f(x["weighted_group_mae_kwh"]), f(x["group_mae_kwh"])]
+             for x in scores if x["sample"] == "fixed_148" and x["period"].startswith("Q")]
+    mrows = [[x["period"], f(x["times"], 0), f(x["W_local"]), f(x["weighted_group_mae_kwh"]),
+              f(next(i for i in indiv if i["scope"] == x["period"])["cf_mae"], 6)]
+             for x in scores if x["sample"] == "fixed_148" and x["period"].startswith("M")]
+    diag = [x for x in indiv if x["scope"] in ("all", "solar_day", "solar_night", "k=1", "k=3", "has_train", "no_train")]
+    names = dict(all="전체 관측 행", solar_day="태양 고도 > 0", solar_night="태양 고도 <= 0",
+                 has_train="V1 학습 기록 있음", no_train="V1 학습 기록 없음")
+    drows = [[names.get(x["scope"], x["scope"]), f(x["rows"], 0), x["sites"], f(x["cf_mae"], 6),
+              f(x["kwh_mae"], 4), f(x["bias_kwh"], 4), f(x["cf_bias"], 6)] for x in diag]
+    lines = ["# B0 V1 기준선 학습과 평가", "", f"작성: {now()}", "",
+             "상태: B0 V1의 두 라운드 학습, 전체 격자 예측과 성능 평가를 완료했다. 기압 제외 B1, V2 확인 C0와 공식 제출은 수행하지 않았다. 기본 EDA 종료와 선택 후보 3개/보류 5개를 유지했다.", "",
+             "## 질문과 목적", "",
+             "[검증과 데이터 처리 설계](2026-10-19_18_검증과_데이터처리_설계.md)와 [S0 점검](2026-10-19_19_S0_구현_점검.md)의 경계와 표본으로 배포 기준선의 최초 검증 성능을 기록한다. 이번 결과는 후속 비교의 기준값이며 다른 모델보다 개선됐다는 판단은 하지 않는다.", "",
+             f"연간 개발 지표 W_148_proxy는 **{f(proxy['W_local'])}**, 집합별 가중 MAE는 **{f(proxy['weighted_group_mae_kwh'])} kWh**다. 전체 관측 행의 cf MAE는 **{f(overall['cf_mae'], 6)}**다. 전체 253개소의 집합 점수는 연말 178시간에서만 정의되므로 이 연간 대리지표와 구분한다.", "",
+             "## 사용 범위와 수행 방법", "",
+             "발전소 메타, 학습 발전량, 학습 A/B 예보와 학습 SMP를 사용했다. 기상 실측과 최종 평가 예보는 모델 입력으로 읽지 않았으며, 원본 보존 해시 확인에만 관련 파일을 포함했다. V2 학습과 평가 및 최종 평가 구간의 예측은 실행하지 않았다.", "",
+             "| 항목 | 실제 적용 |", "|---|---|",
+             "| 예측 대상 구간 시작 s | 2024-01-01 00:00 이상, 2025-01-01 00:00 미만 KST |",
+             "| 예측 대상 종료 ts | 2024-01-01 01:00~2025-01-01 00:00 KST, 8,784시간 |",
+             "| 학습 범위 | s >= 2022-01-01 00:00, ts <= 2023-12-31 00:00 KST |",
+             "| 실제 관측 학습 행 | 1,442,111행, 148개소 |",
+             "| 낮 학습 행 | 라운드별 719,235행, 태양 고도 > 0 |",
+             "| 학습 기록 없는 발전소 | 105개소. 미래 실적으로 보충하지 않고 공동 모델로 예측 |",
+             "| 검증 예측 격자 | 253개소 × 8,784시간 = 라운드별 2,222,352행 |",
+             "| 관측 정답 | 1,884,185행. 없는 실적은 NaN으로 유지 |",
+             "| 참조 구성 용량 | G1(A) 20,465.655 kW, G2(B) 22,189.715 kW |", "",
+             "학습 입력은 배포 코드의 기상 15개와 태양/달력/메타 9개, 총 24개 특징을 사용했다. wa_ground_press도 포함했다. 완료 실행에서 10시와 17시를 각각 한 번 적합한 뒤 검증 1년 동안 고정했다. 조인과 순서/행 수를 검사하고 정확한 정시만 연결했다. 비정시 B 예보 92행은 반올림하지 않았고 예보 결손이 있어도 목표 행을 삭제하지 않았다.", "",
+             "태양 계산과 특징 자료형을 배포 코드와 맞췄다. 학습 목표는 float32 cap으로 나눈 energy를 0~1.2로 자르고 float32로 변환했다. 평가 정답은 음수와 큰 값을 포함해 원본 그대로 유지했다. 각 라운드 예측은 태양 고도 0 이하에서 0, 음수 출력은 0으로 만든 뒤 cap을 곱했다. 상한은 적용하지 않았으며 두 라운드의 kWh 예측을 1:1 산술평균했다. 결측 예보는 LightGBM 기본 처리를 사용하고 별도의 대체값이나 보정값은 적합하지 않았다.", "",
+             "LightGBM 설정은 배포 코드에서 읽어 그대로 적용했다. n_estimators=600, learning_rate=0.06, num_leaves=127, min_child_samples=200, subsample=0.8, subsample_freq=1, colsample_bytree=0.8, verbose=-1, n_jobs=-1이다. 조기 종료와 튜닝은 사용하지 않았다. random_state=None도 원본과 같으며 라이브러리 기본 난수 설정을 사용했다. 모델 파일과 입력/코드 해시를 보존했으나 다른 환경에서 비트 단위로 같은 결과가 나온다고 검증한 것은 아니다.", "",
+             table(["라운드", "낮 학습 행", "낮 기상 NaN 행", "목표 clip 행", "트리 수", "학습 초"],
+                   [[x["round"], f(x["daylight_rows"], 0), f(x["daylight_rows_any_weather_nan"], 0),
+                     f(x["clipped_daylight_targets"], 0), x["trees"], f(x["fit_seconds"])] for x in s["fits"]]), "",
+             "## 성능 평가 결과", "",
+             "W_local은 각 G1/G2에서 발전소 예측과 정답을 먼저 합산한 뒤 절대오차를 취해 SMP×k로 가중한 합이다. k는 KST 종료 시각 11~15시에 3, 나머지에 1이다. R_local은 실제 집합 합계에 SMP를 곱한 합이고 S_local=R_local-0.10×W_local이다. 집합별 가중 MAE는 W_local/(2×ΣSMP×k)다. 발전소별 절대오차 합계와는 다르다.", "",
+             table(["표본", "시각 수", "ΣSMP×k", "W_local", "R_local", "S_local", "가중 집합 MAE (kWh)"],
+                   [[label, f(x["times"], 0), f(x["price_k_sum"]), f(x["W_local"]), f(x["R_local"]),
+                     f(x["S_local"]), f(x["weighted_group_mae_kwh"])] for label, x in
+                    (("고정 148개, W_148_proxy", proxy), ("전체 253개 공통 시각", common))]), "",
+             f"전체 253개 공통 표본은 {common['first_ts']}~{common['last_ts']}의 178시간이다. 148개 고정 표본은 2024년 전체의 8,784시간이며 SMP=0인 {proxy['zero_price_times']}시간도 예측과 비가중 오차에 유지했다. 각 집합의 모든 정답이 있는 시각만 집계하고 부분 합계와 가짜 0 정답은 만들지 않았다. 148개 표본은 EDA에서 연간 가용성을 보고 정한 사후 진단 집단으로 전체 253개소를 대표하지 않으며 제출 용량 조건을 갖춘 구성도 아니다.", "",
+             "### 분기별 고정 148개 진단", "",
+             table(["분기", "시각 수", "ΣSMP×k", "W_148_proxy", "가중 집합 MAE (kWh)", "비가중 집합 MAE (kWh)"], qrows), "",
+             f"가중 집합 MAE가 가장 큰 분기는 {worst['period']}의 {f(worst['weighted_group_mae_kwh'])} kWh다. 분기별 W는 가격 가중 합과 표본 길이에도 영향을 받으므로 W 크기만으로 계절별 정확도를 비교하지 않는다. B1과 비교하지 않았으므로 기존의 5% 악화 문턱이나 채택 규칙을 적용하지 않았다.", "",
+             "### 월별 진단", "",
+             table(["월", "고정 표본 시각", "W_148_proxy", "가중 집합 MAE (kWh)", "전체 관측 cf MAE"], mrows), "",
+             "오른쪽 cf MAE는 해당 월의 전체 관측 행 기준으로 발전소 구성과 관측 수가 달라질 수 있다. 왼쪽 148개 고정 집합 지표와 표본이 같다고 해석하지 않는다.", "",
+             "### 개별 관측 행 진단", "",
+             table(["조건", "관측 행", "발전소", "cf MAE", "kWh MAE", "kWh 편향", "cf 편향"], drows), "",
+             "cf는 energy/capacity_kw이며 MAE와 편향은 관측 행을 같은 비중으로 집계했다. 편향은 예측-정답이다. 밤/낮은 각 발전소의 태양 고도로 구분했다. 밤 예측은 0이므로 비영(0이 아닌) 밤 정답도 오차에 반영된다. 학습 기록 유무는 V1 학습 마감 이전의 실제 기록 기준이다. 두 집단의 기간과 발전소가 다르므로 집단 간 차이를 신규 발전소 여부의 인과 효과로 해석하지 않는다. 발전소별 진단과 월/분기/k 집계는 로컬 산출물에 보존했다.", "",
+             "## 구현 검증과 실행 환경", "",
+             f"정규 CPython {s['runtime']['python']}, LightGBM {s['runtime']['lightgbm']}, pandas {s['runtime']['pandas']}, NumPy {s['runtime']['numpy']}, PyArrow {s['runtime']['pyarrow']}에서 실행했다. 승인된 Start-Process 경로로 시작했으며 완료 실행은 {s['started_at']}~{s['finished_at']}, 학습/예측/평가와 보존 검사를 포함한 경과 시간은 {f(s['wall_seconds'])}초였다.", "",
+             f"- S0 계약과 B0 목표 clip, 야간 0, 음수 출력 처리, 예측 상한 미적용, 라운드 평균 순서의 합성 테스트 {s['synthetic_tests']}개를 통과했다.",
+             "- 실제 학습 자료에서 정상 행과 기상 결손 행을 포함해 두 라운드의 24개 특징 행렬과 학습 목표가 배포 순수 함수와 일치함을 확인했다.",
+             "- 라운드별 2,222,352개 예측이 유한하고 음수가 없으며 전체 키/격자를 보존했다. 정답 결손으로 예측을 삭제하지 않았다. 저장된 세 예측 파일을 다시 읽어 키/행 수와 라운드별 산술평균의 일치, 모델 해시와 실행 코드 사본 해시도 검사했다.",
+             "- 별도 NumPy 집합 누적으로 모든 보고 표본의 W를 대조했다. 월/분기 시각 수와 W/R/S/가격 가중 합의 합계가 연간 결과와 일치했다.",
+             f"- 원본 10개 데이터 파일과 배포 README/baseline.py의 실행 전후 SHA256이 일치했다. S0 입력 해시도 동일했고 EDA 계획 파일의 해시를 그대로 유지했다. 완료 실행의 모델 적합은 2회이며 오류 실행까지 포함한 실제 적합은 총 {s['total_fit_count']}회다.", "",
+             "최초 실행은 10시 모델 적합 후 LightGBM의 네이티브 파일 저장 함수가 한글 경로에 쓰지 못해 종료 코드 1로 중단됐다. 해당 프로세스의 모델을 재사용할 수 없어 저장 경로 처리를 model_to_string과 Python UTF-8 파일 쓰기로 바꾸고 같은 설정의 10시 모델을 다시 적합했다. 패키지 설치나 권한 변경은 하지 않았다. 최초 코드 사본과 실패 단계는 로컬 failed_attempt_01/ 및 failed_attempts.json에 보존했다. 실패 실행에서는 검증 예측과 점수를 만들지 않았으며, 설정 변경이나 점수를 이용한 재시도는 없었다.", "",
+             "## 한계 및 다음 단계", "",
+             "이번 범위의 기준선 결과 정리를 완료했다. 연간 성능은 148개 고정 진단 표본의 대리지표이며 전체 253개 집합의 연간 성능을 확인한 것은 아니다. 공식 scoring.py와 문제정의서가 배포 폴더에 없어 공식 채점기와의 동치도 확인하지 못했으므로 점수는 로컬 W/R/S로 표시했다.", "",
+             "제공 정적 용량과 현재 그룹을 과거에도 동일하게 적용한 참조 구성이다. 실제 과거 용량이나 운영 배정 이력을 재현한 것은 아니며 좌표 익명화의 한계도 남는다. A 기압 변화의 생성 원인과 신규 발전소의 관측 편향 등 기존 한계는 남아 있다. B0 한 설정만 실행했으므로 기압 포함 여부의 우열, V2 재현성, 최종 평가 성능이나 최적 방법을 결론 내리지 않는다. 기압 제외안 비교와 V2는 사용자 요청 전까지 실행하지 않는다. EDA의 종료 판단과 후보/보류 목록은 유지했다.", "",
+             "## 관련 코드와 로컬 산출물", "",
+             "- [B0 V1 학습과 평가](../scripts/b0_v1_baseline.py)",
+             "- [저장된 결과의 보고서 생성](../scripts/report_b0_v1.py)",
+             "- [B0 처리 테스트](../tests/test_b0_validation.py), [시간/조인/로컬 점수](../scripts/validation_core.py)",
+             "- [실행 환경, 해시와 점수 요약](../data/validation/2026-10-19_B0_V1/summary.json)",
+             "- [집합 진단](../data/validation/2026-10-19_B0_V1/group_scores.csv), [관측 행 진단](../data/validation/2026-10-19_B0_V1/individual_scores.csv), [발전소별 진단](../data/validation/2026-10-19_B0_V1/individual_sites.csv)",
+             "- [평균 예측](../data/validation/2026-10-19_B0_V1/predictions_mean.parquet), [10시 예측](../data/validation/2026-10-19_B0_V1/predictions_round_10.parquet), [17시 예측](../data/validation/2026-10-19_B0_V1/predictions_round_17.parquet)",
+             "- [10시 모델](../data/validation/2026-10-19_B0_V1/model_round_10.txt), [17시 모델](../data/validation/2026-10-19_B0_V1/model_round_17.txt)",
+             "- [EDA 상태와 보류 목록](EDA_진행계획.md), [일별 작업 로그](logs/2026-10-19.md)", "",
+             "데이터가 담긴 출력, 모델과 실행 코드 사본은 Git 제외 경로 data/에만 저장했다. 공개 보고서에는 원본/전처리 행과 개별 예측을 복사하지 않았다. 보고서는 저장된 집계로 재생성할 수 있으며 재생성 시 모델을 다시 적합하지 않는다.", ""]
+    text = "\n".join(lines)
+    require(not any(c in text for c in ("\u00b7", "\u2014", "\u2013")), "Forbidden punctuation")
+    REPORT.write_text(text, encoding="utf-8")
+    write_json(OUT / "report_manifest.json", dict(generated_at=now(), report_sha256=digest(REPORT),
+               generator_sha256=digest(Path(__file__)), summary_sha256=digest(OUT / "summary.json")))
+    print(f"Report generated: {REPORT}", flush=True)
+
+
+if __name__ == "__main__":
+    main()
