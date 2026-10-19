@@ -1,0 +1,104 @@
+# Publish only analysis code, intermediate reports, and repository setup files.
+# New top-level paths stay local until explicitly allowed here.
+/*
+!/.gitignore
+!/README.md
+!/데이터_확인_결과.md
+!/중간보고서*.md
+!/reports/
+!/보고서/
+!/scripts/
+!/src/
+!/tests/
+!/notebooks/
+!/pyproject.toml
+!/requirements*.txt
+
+# Competition notices, briefings, transcripts, and slides stay local.
+**/*대회*안내*
+**/*설명회*
+**/*발표자료*
+/scripts/prepare_supplied_slides.ps1
+
+# Never commit original, processed, or extracted competition data.
+# Keep all future datasets inside one of these ignored directories.
+/OIBC_2026_DATA/
+/데이터_확인/
+**/데이터*/
+**/원본*/
+**/전처리*/
+**/[dD][aA][tT][aA]/
+**/[dD][aA][tT][aA][sS][eE][tT]/
+**/[dD][aA][tT][aA][sS][eE][tT][sS]/
+**/[rR][aA][wW]/
+**/[iI][nN][tT][eE][rR][iI][mM]/
+**/[pP][rR][oO][cC][eE][sS][sS][eE][dD]/
+**/[pP][rR][eE][pP][rR][oO][cC][eE][sS][sS][eE][dD]/
+**/[fF][eE][aA][tT][uU][rR][eE][sS]/
+
+# Data files are excluded even when saved outside the directories above.
+*.[cC][sS][vV]
+*.[tT][sS][vV]
+*.[pP][aA][rR][qQ][uU][eE][tT]
+*.pq
+*.arrow
+*.feather
+*.orc
+*.jsonl
+*.ndjson
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+*.h5
+*.hdf
+*.hdf5
+*.mat
+*.nc
+*.netcdf
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+*.xls
+*.xlsx
+*.xlsm
+*.xlsb
+*.ods
+*.avro
+*.rds
+*.RData
+*.rdata
+*.dta
+*.sav
+*.sas7bdat
+
+# Archives can contain copies of the original or processed datasets.
+*.zip
+*.7z
+*.rar
+*.tar
+*.gz
+*.tgz
+*.bz2
+*.xz
+*.zst
+
+# Local Python environments and caches.
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets and operating-system files.
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+Desktop.ini
