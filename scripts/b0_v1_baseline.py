@@ -1,4 +1,4 @@
-"""Fit B0 V1 only. Models, predictions and numeric outputs stay in ignored data/."""
+"""Run registered V1 baselines. Default B0 behavior is preserved; no V2 execution."""
 from __future__ import annotations
 
 import ast
@@ -61,6 +61,13 @@ def target_values(d):
     return (d.energy / d.cap).clip(0, 1.2).astype("float32")
 
 
+def experiment_features(spec, experiment):
+    require(experiment in ("B0_V1", "B1_V1"), "Unregistered experiment")
+    cols = list(spec["FEATS"])
+    require(len(cols) == 24 and cols.count("wa_ground_press") == 1, "Baseline features changed")
+    return cols if experiment == "B0_V1" else [c for c in cols if c != "wa_ground_press"]
+
+
 def prediction_values(d, cf):
     require(len(cf) == len(d) and np.isfinite(cf).all(), "Invalid model output")
     result = np.clip(np.where(d.elev.to_numpy() > 0, cf, 0.0), 0, None) * d.cap.to_numpy()
@@ -118,7 +125,7 @@ def score_samples(truth, prediction, groups, price, fixed_ids):
     return rows
 
 
-def individual_metrics(truth, prediction, sites, trained_ids, spec):
+def individual_metrics(truth, prediction, sites, trained_ids, spec, output=OUT):
     axis = truth.index
     start = axis - pd.Timedelta(hours=1)
     cap = sites.set_index("site_id").capacity_kw.reindex(truth.columns).to_numpy()
@@ -144,14 +151,15 @@ def individual_metrics(truth, prediction, sites, trained_ids, spec):
     per_site = pd.DataFrame({"site_id": truth.columns, "observed_rows": valid.sum(axis=0),
                             "has_train": trained, "cf_mae": np.nanmean(np.abs(cf_error), axis=0),
                             "kwh_mae": np.nanmean(np.abs(error), axis=0), "bias_kwh": np.nanmean(error, axis=0)})
-    per_site.to_csv(OUT / "individual_sites.csv", index=False, encoding="utf-8-sig")
+    per_site.to_csv(output / "individual_sites.csv", index=False, encoding="utf-8-sig")
     return rows
 
 
-def main():
+def main(experiment="B0_V1", output=OUT, extra_code=()):
     sys.stdout.reconfigure(encoding="utf-8")
     require(sys.version_info[:2] == (3, 13) and not sysconfig.get_config_var("Py_GIL_DISABLED"), "Regular CPython 3.13 required")
     spec, params = baseline_contract(), model_parameters()
+    selected = experiment_features(spec, experiment)
     runtime = dict(executable=sys.executable, python=platform.python_version(), lightgbm=lgb.__version__,
                    numpy=np.__version__, pandas=pd.__version__, pyarrow=pyarrow.__version__, free_threaded=False)
     log(f"Runtime: {runtime}; params={params}; random_state={lgb.LGBMRegressor(**params).random_state}")
@@ -161,13 +169,14 @@ def main():
     if "--preflight" in sys.argv:
         log(f"Preflight passed; {result.testsRun} tests; no fit/predict")
         return
-    require(not (OUT / "summary.json").exists(), "Completed run exists; no automatic refit")
-    OUT.mkdir(parents=True, exist_ok=True)
+    require(not (output / "summary.json").exists(), "Completed run exists; no automatic refit")
+    output.mkdir(parents=True, exist_ok=True)
     started, t0 = now(), time.perf_counter()
     files = [Path(__file__), ROOT / "scripts/validation_core.py", ROOT / "scripts/s0_validation_check.py",
              ROOT / "tests/test_validation_core.py", ROOT / "tests/test_b0_validation.py"]
+    files += list(extra_code)
     code_hashes = {str(p.relative_to(ROOT)): digest(p) for p in files}
-    archive = OUT / "executed_code"
+    archive = output / "executed_code"
     archive.mkdir(exist_ok=True)
     for p in files:
         (archive / p.name).write_bytes(p.read_bytes())
@@ -175,6 +184,14 @@ def main():
     eda_hash = digest(ROOT / "reports/EDA_진행계획.md")
     s0 = json.loads((ROOT / "data/validation/2026-10-19_S0/summary.json").read_text(encoding="utf-8"))
     require(before == s0["source_sha256"] and eda_hash == s0["eda_plan_sha256"], "S0 input/EDA drift")
+    if experiment == "B1_V1":
+        b0 = json.loads((OUT / "summary.json").read_text(encoding="utf-8"))
+        require(b0["status"] == "passed" and before == b0["source_sha256"], "B0 inputs differ")
+        require(params == b0["model_parameters"] and runtime == b0["runtime"], "B0 settings/runtime differ")
+        require(spec["FEATS"] == b0["model_features"], "B0 feature contract differs")
+        b0_files = ["summary.json", "predictions_round_10.parquet", "predictions_round_17.parquet",
+                    "predictions_mean.parquet", "model_round_10.txt", "model_round_17.txt"]
+        b0_artifact_hashes = {f: digest(OUT / f) for f in b0_files}
     sites = pd.read_csv(SOURCE / "sites.csv", encoding="utf-8-sig")
     capacities = metadata(sites)
     gen = pd.read_parquet(SOURCE / "train/generation.parquet")
@@ -204,39 +221,40 @@ def main():
         d, x = feature_frame(base, fa, fb, r, spec)
         day = d.elev.gt(0)
         y = target_values(d.loc[day])
-        x = x.loc[day]
-        require(len(x) == 719235 and len(x.columns) == 24 and "wa_ground_press" in x, "B0 training contract drift")
+        x = x.loc[day, selected]
+        require(len(x) == 719235 and x.columns.tolist() == selected, "V1 training contract drift")
+        weather_selected = [c for c in selected if c in spec["FEATS"][:15]]
         fit_info = dict(round=r, train_rows=len(base), daylight_rows=len(x),
-                        daylight_rows_any_weather_nan=int(x[spec["FEATS"][:15]].isna().any(axis=1).sum()),
+                        daylight_rows_any_weather_nan=int(x[weather_selected].isna().any(axis=1).sum()),
                         clipped_daylight_targets=int(((d.loc[day].energy / d.loc[day].cap) != y).sum()),
                         train_ts_min=str(base.ts.min()), train_ts_max=str(base.ts.max()))
         # Count true clipping before float32 conversion, not precision conversion.
         raw_y = d.loc[day].energy / d.loc[day].cap
         fit_info["clipped_daylight_targets"] = int(((raw_y < 0) | (raw_y > 1.2)).sum())
-        log(f"B0 V1 round={r}: fitting {x.shape}")
+        log(f"{experiment} round={r}: fitting {x.shape}")
         fit_t0 = time.perf_counter()
         model = lgb.LGBMRegressor(**params)
         model.fit(x, y)
         fit_info.update(fit_seconds=time.perf_counter() - fit_t0, trees=model.booster_.num_trees(),
                         estimator_params=model.get_params(), booster_params=model.booster_.params)
         require(fit_info["trees"] == 600, "Unexpected tree count")
-        path = OUT / f"model_round_{r}.txt"
+        path = output / f"model_round_{r}.txt"
         # Native LightGBM file IO cannot write this Windows non-ASCII path.
         path.write_text(model.booster_.model_to_string(), encoding="utf-8")
         fit_info["model_sha256"] = digest(path)
         del d, x, y, raw_y
         gc.collect()
-        log(f"B0 V1 round={r}: fit complete; predicting monthly full grids")
+        log(f"{experiment} round={r}: fit complete; predicting monthly full grids")
         pieces = []
         for month_axis in monthly(axis):
             d, x = feature_frame(grid(sites, month_axis), fa, fb, r, spec)
-            d["kwh"] = prediction_values(d, model.predict(x))
+            d["kwh"] = prediction_values(d, model.predict(x[selected]))
             pieces.append(d[KEY + ["kwh"]].copy())
             log(f"round={r}: {month_axis[0]}..{month_axis[-1]}, rows={len(d):,}")
         flat = pd.concat(pieces, ignore_index=True)
         unique(flat, KEY)
         require(len(flat) == len(axis) * 253, "Prediction grid lost rows")
-        flat.to_parquet(OUT / f"predictions_round_{r}.parquet", index=False, compression="zstd")
+        flat.to_parquet(output / f"predictions_round_{r}.parquet", index=False, compression="zstd")
         predictions[r] = flat.pivot(index="ts", columns="site_id", values="kwh").reindex(index=axis, columns=sites.site_id)
         require(np.isfinite(predictions[r].to_numpy()).all(), "Incomplete prediction matrix")
         fits.append(fit_info)
@@ -244,11 +262,18 @@ def main():
         gc.collect()
     ensemble = (predictions[10] + predictions[17]) / 2
     ensemble.rename_axis(index="ts", columns="site_id").stack().rename("kwh").reset_index().to_parquet(
-        OUT / "predictions_mean.parquet", index=False, compression="zstd")
+        output / "predictions_mean.parquet", index=False, compression="zstd")
     grouped = score_samples(truth, ensemble, groups, price, fixed_ids)
-    individual = individual_metrics(truth, ensemble, sites, trained_ids, spec)
-    pd.DataFrame(grouped).to_csv(OUT / "group_scores.csv", index=False, encoding="utf-8-sig")
-    pd.DataFrame(individual).to_csv(OUT / "individual_scores.csv", index=False, encoding="utf-8-sig")
+    individual = individual_metrics(truth, ensemble, sites, trained_ids, spec, output=output)
+    pd.DataFrame(grouped).to_csv(output / "group_scores.csv", index=False, encoding="utf-8-sig")
+    pd.DataFrame(individual).to_csv(output / "individual_scores.csv", index=False, encoding="utf-8-sig")
+    comparison = None
+    if experiment == "B1_V1":
+        from b1_v1_compare import compare_results, verify_saved_b0
+        verify_saved_b0(truth, groups, price, fixed_ids, b0)
+        comparison = compare_results(b0["group_scores"], grouped)
+        require(b0_artifact_hashes == {f: digest(OUT / f) for f in b0_files}, "B0 artifacts changed")
+        comparison["b0_artifact_sha256"] = b0_artifact_hashes
     for sample in ("fixed_148", "common_253"):
         overall = next(s for s in grouped if s["sample"] == sample and s["period"] == "all")
         quarters = [s for s in grouped if s["sample"] == sample and s["period"].startswith("Q")]
@@ -260,25 +285,25 @@ def main():
     require(before == {f: digest(SOURCE / f) for f in INPUTS}, "Source changed")
     require(eda_hash == digest(ROOT / "reports/EDA_진행계획.md"), "EDA state changed")
     require(code_hashes == {str(p.relative_to(ROOT)): digest(p) for p in files}, "Code changed during run")
-    failure_path = OUT / "failed_attempts.json"
+    failure_path = output / "failed_attempts.json"
     failure = json.loads(failure_path.read_text(encoding="utf-8-sig")) if failure_path.exists() else None
-    summary = dict(experiment="B0_V1", status="passed", started_at=started, finished_at=now(),
+    summary = dict(experiment=experiment, status="passed", started_at=started, finished_at=now(),
                    wall_seconds=time.perf_counter() - t0, runtime=runtime, source_sha256=before,
                    code_sha256=code_hashes, eda_plan_sha256=eda_hash, source_unchanged=True,
                    eda_state_unchanged=True, model_fit_count=2,
                    total_fit_count=2 + (failure["completed_fits"] if failure else 0), failed_attempt=failure,
-                   B1_executed=False, V2_executed=False,
+                   B1_executed=experiment == "B1_V1", V2_executed=False,
                    final_evaluation_executed=False, official_submission=False, synthetic_tests=result.testsRun,
                    feature_parity=True, independent_score_check=True, partition_checks=True,
-                   model_features=spec["FEATS"], model_parameters=params, random_state=None,
+                   model_features=selected, model_parameters=params, random_state=None,
                    seed_note="Unchanged baseline random_state=None; LightGBM default seeds, no seed search; exact bitwise reproducibility is not claimed.",
                    training_window=vars(window), train_sites=len(trained_ids), zero_train_sites=253-len(trained_ids),
                    prediction_times=len(axis), prediction_rows_per_round=len(axis)*253,
                    observed_truth_rows=int(truth.notna().to_numpy().sum()), fixed_148_sites=fixed_ids,
                    capacity_kw={k: float(v) for k, v in capacities.items()}, nonhourly=nonhourly,
-                   fits=fits, group_scores=grouped, individual_scores=individual)
-    write_json(OUT / "summary.json", summary)
-    log(f"B0 V1 passed; 2 successful-run fits, total fits={summary['total_fit_count']}; ensemble scored; B1/V2/final evaluation not executed")
+                   fits=fits, group_scores=grouped, individual_scores=individual, comparison=comparison)
+    write_json(output / "summary.json", summary)
+    log(f"{experiment} passed; 2 successful-run fits, total fits={summary['total_fit_count']}; ensemble scored; V2/final evaluation not executed")
 
 
 if __name__ == "__main__":
