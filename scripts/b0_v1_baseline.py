@@ -1,4 +1,4 @@
-"""Run registered V1 baselines. Default B0 behavior is preserved; no V2 execution."""
+"""Run registered V1 experiments and the frozen B0 V2 confirmation."""
 from __future__ import annotations
 
 import ast
@@ -62,10 +62,10 @@ def target_values(d):
 
 
 def experiment_features(spec, experiment):
-    require(experiment in ("B0_V1", "B1_V1"), "Unregistered experiment")
+    require(experiment in ("B0_V1", "B1_V1", "B0_V2"), "Unregistered experiment")
     cols = list(spec["FEATS"])
     require(len(cols) == 24 and cols.count("wa_ground_press") == 1, "Baseline features changed")
-    return cols if experiment == "B0_V1" else [c for c in cols if c != "wa_ground_press"]
+    return [c for c in cols if c != "wa_ground_press"] if experiment == "B1_V1" else cols
 
 
 def prediction_values(d, cf):
@@ -143,7 +143,8 @@ def individual_metrics(truth, prediction, sites, trained_ids, spec, output=OUT):
     rows = []
     cf_error = error / cap[None, :]
     for label, mask in masks:
-        require(mask.any(), "Empty diagnostic mask")
+        if not mask.any():
+            continue  # Absent months or no-training cohorts have no defined metric.
         rows.append(dict(scope=label, rows=int(mask.sum()), sites=int(mask.any(axis=0).sum()),
                          cf_mae=float(np.abs(cf_error[mask]).mean()),
                          kwh_mae=float(np.abs(error[mask]).mean()),
@@ -192,25 +193,36 @@ def main(experiment="B0_V1", output=OUT, extra_code=()):
         b0_files = ["summary.json", "predictions_round_10.parquet", "predictions_round_17.parquet",
                     "predictions_mean.parquet", "model_round_10.txt", "model_round_17.txt"]
         b0_artifact_hashes = {f: digest(OUT / f) for f in b0_files}
+    v1_frozen = None
+    if experiment == "B0_V2":
+        from b0_v2_confirm import freeze_v1
+        v1_frozen = freeze_v1(before, eda_hash, params, selected, runtime)
     sites = pd.read_csv(SOURCE / "sites.csv", encoding="utf-8-sig")
     capacities = metadata(sites)
     gen = pd.read_parquet(SOURCE / "train/generation.parquet")
     gen["ts"] = times(gen.ts)
     unique(gen, KEY)
-    window = WINDOWS[0]
-    require(window.name == "V1", "Only V1 allowed")
+    window = WINDOWS[1] if experiment == "B0_V2" else WINDOWS[0]
+    expected = next(w for w in s0["windows"] if w["name"] == window.name)
     axis = window.axis()
     truth = truth_matrix(gen, sites.site_id, axis)
-    fixed_ids = truth.columns[truth.notna().all(axis=0)].tolist()
-    require(fixed_ids == s0["fixed_148_sites"], "Diagnostic cohort drift")
+    if window.name == "V1":
+        fixed_ids = truth.columns[truth.notna().all(axis=0)].tolist()
+        require(fixed_ids == s0["fixed_148_sites"], "Diagnostic cohort drift")
+    else:
+        fixed_ids = s0["fixed_148_sites"]
+        require(len(fixed_ids) == 148 and truth[fixed_ids].notna().all().all(), "Frozen 148 cohort unavailable")
+    require(int(truth.notna().to_numpy().sum()) == expected["observed_target_rows"]
+            and int(truth.notna().all(axis=1).sum()) == expected["common_253_times"], "S0 target mismatch")
     train = window.training(gen)
-    require(len(train) == 1442111, "S0 train row mismatch")
+    require(len(train) == expected["train_rows"], "S0 train row mismatch")
     trained_ids = train.site_id.unique().tolist()
+    require(len(trained_ids) == expected["train_sites"], "S0 training sites mismatch")
     base = train.merge(sites, on="site_id", how="left", validate="many_to_one", sort=False)
     price = pd.read_csv(SOURCE / "train/smp.csv", encoding="utf-8-sig")
     price["ts"] = times(price.ts)
     unique(price, ["ts"])
-    require(np.isfinite(price.set_index("ts").reindex(axis).smp).all(), "V1 prices missing")
+    require(np.isfinite(price.set_index("ts").reindex(axis).smp).all(), "Validation prices missing")
     del gen, train
     fa, fb, nonhourly = load_forecasts("train", spec)
     require(check_feature_parity(base, fa, fb, spec), "Feature parity failed")
@@ -222,7 +234,8 @@ def main(experiment="B0_V1", output=OUT, extra_code=()):
         day = d.elev.gt(0)
         y = target_values(d.loc[day])
         x = x.loc[day, selected]
-        require(len(x) == 719235 and x.columns.tolist() == selected, "V1 training contract drift")
+        require(len(x) == expected["daylight_train_rows_per_round"] and x.columns.tolist() == selected,
+                "Registered training contract drift")
         weather_selected = [c for c in selected if c in spec["FEATS"][:15]]
         fit_info = dict(round=r, train_rows=len(base), daylight_rows=len(x),
                         daylight_rows_any_weather_nan=int(x[weather_selected].isna().any(axis=1).sum()),
@@ -285,6 +298,9 @@ def main(experiment="B0_V1", output=OUT, extra_code=()):
     require(before == {f: digest(SOURCE / f) for f in INPUTS}, "Source changed")
     require(eda_hash == digest(ROOT / "reports/EDA_진행계획.md"), "EDA state changed")
     require(code_hashes == {str(p.relative_to(ROOT)): digest(p) for p in files}, "Code changed during run")
+    if v1_frozen is not None:
+        from b0_v2_confirm import verify_v1_frozen
+        verify_v1_frozen(v1_frozen)
     failure_path = output / "failed_attempts.json"
     failure = json.loads(failure_path.read_text(encoding="utf-8-sig")) if failure_path.exists() else None
     summary = dict(experiment=experiment, status="passed", started_at=started, finished_at=now(),
@@ -292,7 +308,7 @@ def main(experiment="B0_V1", output=OUT, extra_code=()):
                    code_sha256=code_hashes, eda_plan_sha256=eda_hash, source_unchanged=True,
                    eda_state_unchanged=True, model_fit_count=2,
                    total_fit_count=2 + (failure["completed_fits"] if failure else 0), failed_attempt=failure,
-                   B1_executed=experiment == "B1_V1", V2_executed=False,
+                   B1_executed=experiment == "B1_V1", V2_executed=window.name == "V2",
                    final_evaluation_executed=False, official_submission=False, synthetic_tests=result.testsRun,
                    feature_parity=True, independent_score_check=True, partition_checks=True,
                    model_features=selected, model_parameters=params, random_state=None,
@@ -301,9 +317,10 @@ def main(experiment="B0_V1", output=OUT, extra_code=()):
                    prediction_times=len(axis), prediction_rows_per_round=len(axis)*253,
                    observed_truth_rows=int(truth.notna().to_numpy().sum()), fixed_148_sites=fixed_ids,
                    capacity_kw={k: float(v) for k, v in capacities.items()}, nonhourly=nonhourly,
-                   fits=fits, group_scores=grouped, individual_scores=individual, comparison=comparison)
+                   fits=fits, group_scores=grouped, individual_scores=individual, comparison=comparison,
+                   v1_frozen=v1_frozen)
     write_json(output / "summary.json", summary)
-    log(f"{experiment} passed; 2 successful-run fits, total fits={summary['total_fit_count']}; ensemble scored; V2/final evaluation not executed")
+    log(f"{experiment} passed; 2 successful-run fits, total fits={summary['total_fit_count']}; ensemble scored; final evaluation not executed")
 
 
 if __name__ == "__main__":
