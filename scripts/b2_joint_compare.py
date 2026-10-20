@@ -162,8 +162,8 @@ def run_precheck():
     log(f"Precheck passed without fit/score; T0 train={len(train):,}, daylight={nday:,}, cohort={len(ids)}, groups={value['T0']['group_sites']}")
 
 
-def fit_predict(window, method, gen, sites, fa, fb, spec, params, target):
-    folder = OUT/window.name/method
+def fit_predict(window, method, gen, sites, fa, fb, spec, params, target, output_root=OUT):
+    folder = output_root/window.name/method
     folder.mkdir(parents=True, exist_ok=True)
     require(not (folder/"fit_summary.json").exists(), "Completed fits exist; no refit")
     train = window.training(gen)
