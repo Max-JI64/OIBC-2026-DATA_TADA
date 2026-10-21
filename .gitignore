@@ -38,7 +38,6 @@
 **/[fF][eE][aA][tT][uU][rR][eE][sS]/
 
 # Data files are excluded even when saved outside the directories above.
-*.[cC][sS][vV]
 *.[tT][sS][vV]
 *.[pP][aA][rR][qQ][uU][eE][tT]
 *.pq
@@ -103,3 +102,7 @@ venv/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Always exclude every CSV, including analysis summaries and submissions.
+# Keep this rule after the publication allowlist. Do not force-add CSV files.
+*.[cC][sS][vV]
